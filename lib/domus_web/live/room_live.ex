@@ -47,18 +47,30 @@ defmodule DomusWeb.RoomLive do
       order_by: [desc: l.inserted_at],
       limit: 100
     )
+
+    pending_logs = Domus.Repo.all(
+      from l in Domus.Tracking.Log,
+      where: l.room_code == ^room_code and is_nil(l.approved_by),
+      order_by: [desc: l.inserted_at]
+    )
     
-    all_names = Domus.Repo.all(
+    approved_logs = Domus.Repo.all(
       from l in Domus.Tracking.Log,
       where: l.room_code == ^room_code and not is_nil(l.approved_by),
-      select: l.roommate_name
+      select: {l.roommate_name, l.chore}
     )
 
-    leaderboard = Enum.reduce(all_names, %{}, fn name, acc -> 
+    leaderboard = Enum.reduce(approved_logs, %{}, fn {name, chore}, acc -> 
       clean_name = normalize_name(name)
-      Map.update(acc, clean_name, 1, &(&1 + 1))
+      acc
+      |> Map.update(clean_name, %{total: 1, chores: %{chore => 1}}, fn stats ->
+        %{
+          total: stats.total + 1,
+          chores: Map.update(stats.chores, chore, 1, &(&1 + 1))
+        }
+      end)
     end)
-    |> Enum.sort_by(fn {_name, count} -> count end, :desc)
+    |> Enum.sort_by(fn {_name, stats} -> stats.total end, :desc)
 
     members = Domus.Repo.all(
       from rm in Domus.Tracking.RoomMember,
@@ -69,6 +81,7 @@ defmodule DomusWeb.RoomLive do
 
     socket
     |> assign(:logs, logs)
+    |> assign(:pending_logs, pending_logs)
     |> assign(:leaderboard, leaderboard)
     |> assign(:members, members)
   end
@@ -82,13 +95,13 @@ defmodule DomusWeb.RoomLive do
   end
 
   def handle_event("log_chore", %{"chore" => chore}, socket) do
-    insert_log(socket, chore, DateTime.utc_now() |> DateTime.truncate(:second))
+    insert_log(socket, chore, NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second))
   end
 
   def handle_event("log_past", params, socket) do
     chore = params["chore"] || List.first(socket.assigns.chores)
     date = socket.assigns.selected_date || Date.utc_today()
-    {:ok, datetime} = DateTime.new(date, ~T[12:00:00], "Etc/UTC")
+    datetime = NaiveDateTime.new!(date, ~T[12:00:00])
     insert_log(socket, chore, datetime)
   end
 
@@ -233,10 +246,13 @@ defmodule DomusWeb.RoomLive do
   defp insert_log(socket, chore, datetime) do
     name = socket.assigns.name
     room_code = socket.assigns.room_code
+    is_super = socket.assigns.is_super_user
     
     if name do
       clean_name = normalize_name(name)
-      case Domus.Repo.insert(%Domus.Tracking.Log{room_code: room_code, roommate_name: clean_name, chore: chore, inserted_at: datetime, updated_at: datetime}) do
+      approved_by = if is_super, do: clean_name, else: nil
+      
+      case Domus.Repo.insert(%Domus.Tracking.Log{room_code: room_code, roommate_name: clean_name, chore: chore, inserted_at: datetime, updated_at: datetime, approved_by: approved_by}) do
         {:ok, _log} -> 
           DomusWeb.Endpoint.broadcast_from(self(), "room:#{room_code}", "new_log", %{})
           {:noreply, load_data(socket)}
@@ -281,14 +297,14 @@ defmodule DomusWeb.RoomLive do
     ~H"""
     <div class="room-container">
       <%= if @name do %>
-        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line-color); padding-bottom: 15px; margin-bottom: 30px;">
-          <div style="display: flex; align-items: center; gap: 10px;">
+        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 15px; border-bottom: 1px solid var(--line-color); padding-bottom: 15px; margin-bottom: 30px;">
+          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 10px;">
             <div class="user-badge" style="margin: 0;">Resident: <%= @name %><%= if @is_super_user, do: " (Super User)" %></div>
             <.link navigate={~p"/users/settings"} title="Edit Profile" style="color: var(--text-main); display: flex; align-items: center; transition: opacity 0.2s;" onmouseover="this.style.opacity='0.6'" onmouseout="this.style.opacity='1'">
               <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
             </.link>
           </div>
-          <div style="display: flex; gap: 15px; align-items: center;">
+          <div style="display: flex; flex-wrap: wrap; gap: 15px; align-items: center;">
             <%= if @is_super_user do %>
               <button phx-click="delete_room" data-confirm="CRITICAL: Are you sure you want to PERMANENTLY destroy this ledger? All history and members will be deleted. This cannot be undone." style="background: none; border: none; padding: 0; color: #cc0000; font-size: 0.9rem; font-weight: bold; cursor: pointer; text-decoration: underline; font-family: 'Lato', sans-serif; width: auto; box-shadow: none;">Delete Ledger</button>
             <% end %>
@@ -348,14 +364,49 @@ defmodule DomusWeb.RoomLive do
         </div>
       </div>
 
+      <% pending_for_me = Enum.filter(@pending_logs, fn log -> @name && normalize_name(@name) != normalize_name(log.roommate_name) end) %>
+      <%= if not Enum.empty?(pending_for_me) do %>
+        <div style="background: rgba(180, 83, 9, 0.05); border: 1px solid rgba(180, 83, 9, 0.3); padding: 20px; margin-bottom: 40px; border-radius: 4px;">
+          <h4 style="color: #b45309; font-family: 'Playfair Display', serif; font-size: 1.4rem; margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
+            <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
+            Pending Verifications
+          </h4>
+          <ul style="list-style: none; padding: 0; margin: 0; font-family: 'Lato', sans-serif; font-size: 0.95rem;">
+            <%= for log <- pending_for_me do %>
+              <li style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 15px; padding: 10px 0; border-bottom: 1px dashed rgba(180, 83, 9, 0.2);">
+                <span><strong style="color: var(--text-main);"><%= normalize_name(log.roommate_name) %></strong> recorded <em style="font-family: 'Playfair Display', serif; font-size: 1.1rem; color: var(--text-main);"><%= log.chore %></em></span>
+                <div style="display: flex; gap: 10px;">
+                  <button phx-click="approve_log" phx-value-id={log.id} style="background: #15803d; color: white; border: none; padding: 6px 15px; border-radius: 2px; cursor: pointer; text-transform: uppercase; font-size: 0.75rem; font-weight: bold; letter-spacing: 1px; transition: opacity 0.2s;" onmouseover="this.style.opacity='0.8'" onmouseout="this.style.opacity='1'">Verify</button>
+                  <%= if @is_super_user do %>
+                    <button phx-click="delete_log" phx-value-id={log.id} style="background: transparent; color: #cc0000; border: 1px solid #cc0000; padding: 6px 15px; border-radius: 2px; cursor: pointer; text-transform: uppercase; font-size: 0.75rem; font-weight: bold; letter-spacing: 1px; transition: all 0.2s;" onmouseover="this.style.background='#cc0000'; this.style.color='white';" onmouseout="this.style.background='transparent'; this.style.color='#cc0000';">Reject & Delete</button>
+                  <% end %>
+                </div>
+              </li>
+            <% end %>
+          </ul>
+        </div>
+      <% end %>
+
       <div class="editorial-section">
         <h3>The Laureates</h3>
         <div class="stat-blocks">
-          <%= for {person, count} <- @leaderboard do %>
+          <%= for {person, stats} <- @leaderboard do %>
             <div class="stat-block">
               <div class="stat-name"><%= person %></div>
-              <div class="stat-count"><%= count %></div>
+              <div class="stat-count"><%= stats.total %></div>
               <div class="stat-label">Contributions</div>
+              
+              <div style="margin-top: 20px; text-align: left; border-top: 1px solid rgba(0,0,0,0.1); padding-top: 15px;">
+                <h4 style="font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 10px;">The Ledger</h4>
+                <ul style="list-style: none; padding: 0; margin: 0; font-family: 'Lato', sans-serif; font-size: 0.9rem;">
+                  <%= for {chore, count} <- stats.chores do %>
+                    <li style="display: flex; justify-content: space-between; margin-bottom: 5px; border-bottom: 1px dashed rgba(0,0,0,0.1); padding-bottom: 3px;">
+                      <span><%= chore %></span>
+                      <strong><%= count %></strong>
+                    </li>
+                  <% end %>
+                </ul>
+              </div>
             </div>
           <% end %>
           <%= if Enum.empty?(@leaderboard) do %>
@@ -450,48 +501,66 @@ defmodule DomusWeb.RoomLive do
       </div>
 
       <div class="editorial-section">
-        <h3>The Ledger</h3>
-        <ul class="log-list">
-          <%= for log <- @logs do %>
-            <li>
-              <div style="flex: 1;"><strong><%= normalize_name(log.roommate_name) %></strong> <span><%= log.chore %></span></div>
-              <div class="time" style="display: flex; align-items: center; gap: 10px;">
-                <%= if is_nil(log.approved_by) do %>
-                  <span style="color: #b45309; font-style: italic; font-family: 'Playfair Display', serif;">Unverified</span>
-                  <%= if @name && normalize_name(@name) != normalize_name(log.roommate_name) do %>
-                    <button phx-click="approve_log" phx-value-id={log.id} style="background: none; border: none; padding: 0; color: #15803d; font-size: 0.9rem; font-weight: bold; cursor: pointer; text-transform: uppercase; letter-spacing: 1px; box-shadow: none; font-family: 'Lato', sans-serif; width: auto;">(Approve)</button>
+        <details class="ledger-dropdown">
+          <summary style="font-family: 'Playfair Display', serif; font-size: 1.5rem; cursor: pointer; user-select: none; display: flex; justify-content: space-between; align-items: center; margin-bottom: 0;">
+            <h3>Global Ledger History</h3>
+            <span class="dropdown-icon" style="font-size: 1rem; color: var(--text-muted);">&#9660;</span>
+          </summary>
+          
+          <div style="margin-top: 20px; background: rgba(0,0,0,0.02); padding: 15px; border: 1px solid var(--line-color); border-radius: 4px;">
+            <ul class="terminal-log-list">
+              <%= for log <- @logs do %>
+                <li>
+                  <span class="log-time">[<%= format_time_compact(log.inserted_at) %>]</span>
+                  <span class="log-name"><%= normalize_name(log.roommate_name) %></span>
+                  <span class="log-action">executed</span>
+                  <span class="log-chore"><%= log.chore %></span>
+                  
+                  <%= if is_nil(log.approved_by) do %>
+                    <span class="log-status unverified">pending</span>
+                    <%= if @name && normalize_name(@name) != normalize_name(log.roommate_name) do %>
+                      <button phx-click="approve_log" phx-value-id={log.id} class="log-btn approve-btn">Approve</button>
+                    <% end %>
+                  <% else %>
+                    <span class="log-status verified">ok:<%= log.approved_by %></span>
                   <% end %>
-                <% else %>
-                  <span style="color: #15803d; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; font-family: 'Lato', sans-serif;">Verified by <%= log.approved_by %></span>
-                <% end %>
-                <span style="opacity: 0.3;">|</span>
-                <span style="min-width: 120px; text-align: right;"><%= format_time(log.inserted_at) %></span>
-                <%= if @is_super_user or (@name && normalize_name(@name) == normalize_name(log.roommate_name)) do %>
-                  <button phx-click="delete_log" phx-value-id={log.id} style="background: none; border: none; padding: 0; color: #cc0000; font-size: 1.6rem; cursor: pointer; width: auto; box-shadow: none; line-height: 1;" title="Delete Entry">&times;</button>
-                <% end %>
-              </div>
-            </li>
-          <% end %>
-          <%= if Enum.empty?(@logs) do %>
-            <p class="empty" style="color: var(--text-muted); text-align: center; padding: 20px 0;">Blank pages.</p>
-          <% end %>
-        </ul>
+                  
+                  <%= if @is_super_user or (@name && normalize_name(@name) == normalize_name(log.roommate_name)) do %>
+                    <button phx-click="delete_log" phx-value-id={log.id} class="log-btn delete-btn">Del</button>
+                  <% end %>
+                </li>
+              <% end %>
+              <%= if Enum.empty?(@logs) do %>
+                <li style="color: var(--text-muted); justify-content: center; padding: 20px 0; font-family: 'Playfair Display', serif; font-style: italic;">Blank pages.</li>
+              <% end %>
+            </ul>
+          </div>
+        </details>
       </div>
     </div>
     """
   end
 
   defp format_time(datetime) do
-    local_dt = DateTime.add(datetime, 19800, :second)
+    local_dt = NaiveDateTime.add(datetime, 19800, :second)
     
-    date = DateTime.to_date(local_dt)
-    time = DateTime.to_time(local_dt)
+    date = NaiveDateTime.to_date(local_dt)
+    time = NaiveDateTime.to_time(local_dt)
     
     hour = if time.hour == 0, do: 12, else: (if time.hour > 12, do: time.hour - 12, else: time.hour)
     am_pm = if time.hour >= 12, do: "PM", else: "AM"
     minute = String.pad_leading(Integer.to_string(time.minute), 2, "0")
     
     "#{date} — #{hour}:#{minute} #{am_pm}"
+  end
+
+  defp format_time_compact(datetime) do
+    local_dt = NaiveDateTime.add(datetime, 19800, :second)
+    
+    date = NaiveDateTime.to_date(local_dt)
+    time = NaiveDateTime.to_time(local_dt)
+    
+    "#{date.month}/#{date.day} #{String.pad_leading(Integer.to_string(time.hour), 2, "0")}:#{String.pad_leading(Integer.to_string(time.minute), 2, "0")}"
   end
 
   defp chore_icon("Water Plants") do
